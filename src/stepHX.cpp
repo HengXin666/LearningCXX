@@ -18,6 +18,7 @@ struct RepeatAwaiter {
     void await_resume() const noexcept {}
 };
 
+template<class T>
 struct Promise {
     auto initial_suspend() {
         return std::suspend_always();
@@ -31,7 +32,7 @@ struct Promise {
         throw;
     }
 
-    auto yield_value(int ret) {
+    auto yield_value(T ret) {
         mRetValue = ret;
         return RepeatAwaiter();
     }
@@ -44,11 +45,12 @@ struct Promise {
         return std::coroutine_handle<Promise>::from_promise(*this);
     }
 
-    int mRetValue;
+    T mRetValue;
 };
 
+template<class T>
 struct Task {
-    using promise_type = Promise;
+    using promise_type = Promise<T>;
 
     Task(std::coroutine_handle<promise_type> coroutine)
         : mCoroutine(coroutine) {}
@@ -56,15 +58,23 @@ struct Task {
     std::coroutine_handle<promise_type> mCoroutine;
 };
 
-Task itoa(int n) {
+template<class T>
+Task<T> fib() {
+    T a = 1, b = 1;
+    co_yield a;
+    co_yield b;
     while (1) {
-        co_yield n++;
+        T c = a + b;
+        co_yield c;
+        a = b;
+        b = c;
     }
 }
 
 int main() {
     // 实现一个 生成器
-    auto task = itoa(10);
+    using ll = long long;
+    auto task = fib<ll>();
     while (1) {
         task.mCoroutine.resume();
         std::cout << task.mCoroutine.promise().mRetValue << '\n';
