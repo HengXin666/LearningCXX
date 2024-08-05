@@ -45,21 +45,48 @@ struct PreviousAwaiter {
 template <class T>
 struct Promise {
     auto initial_suspend() { 
-        return std::suspend_always();
+        return std::suspend_always(); // 第一次创建, 直接挂起
     }
 
     auto final_suspend() noexcept {
-        return PreviousAwaiter(_previous);
+        return PreviousAwaiter(_previous); // 这里执行完了后, 就 段错误..., 原来是 _res 没有赋值上..
     }
 
     void unhandled_exception() noexcept {}
 
     void return_value(T res) {
-        new (&_previous) T(std::move(res)); // 设置协程的返回值
+    /**
+    在这段代码中，new (&_previous) T(std::move(res)); 
+    不是语法糖，而是使用了一个名为"placement new"的语法来在已经分配的内存区域上构造对象。
+    这里有几个重要的概念和操作：
+
+    1.  Placement New: 通常情况下，new 关键字分配内存并调用构造函数。
+        但在 "placement new" 中，new 后面跟着的地址（如 & _previous），
+        表示在这个特定的地址上调用构造函数，而不会分配新的内存。
+        这个操作允许在指定的内存地址上重新构造对象。
+
+    2.  Move 构造函数: T(std::move(res)) 调用了类型 T 的移动构造函数，
+        将临时对象 res 的所有权转移到 _previous。
+        std::move 用来显式地转换 res 为右值引用，使得 T 的移动构造函数可以被调用。
+
+    3.  _previous: 这是一个已经分配了内存的对象或内存位置，
+        placement new 会在这个内存位置上重新构造 T 类型的对象。
+        可能 _previous 是一个联合（union），
+        或者是一个尚未构造的存储区域（如 std::aligned_storage）。
+
+    示例解释
+        假设 _previous 是一个联合中的成员，并且之前没有构造对象，
+        现在想在这个联合中构造一个类型为 T 的对象并赋值为 res。
+        那么，使用 new (&_previous) T(std::move(res)); 这样的语法可以达到这个目的。
+    这种技术通常在高性能代码中使用，避免了不必要的内存分配和复制。
+    **/
+        _res = res;
+        // new (&_previous) T(std::move(res)); // 设置协程的返回值
     }
 
     auto yield_value(T res) {
-        new (&_previous) T(std::move(res)); // 设置协程的返回值
+        _res = res;
+        // new (&_previous) T(std::move(res)); // 设置协程的返回值
         return std::suspend_always();       // 挂起协程
     }
 
@@ -73,11 +100,9 @@ struct Promise {
         return std::coroutine_handle<Promise>::from_promise(*this);
     }
 
-    Promise() = default;
-    Promise(Promise &&) = delete;
-    ~Promise() = default;
+    Promise &operator=(Promise &&) = delete;
 
-
+    // 注: 不写 命名, 且不实例化为变量, 则默认已经实例化, 并且作用域是 class 内, 即可 this->_res
     union {
         T _res;
     };
@@ -107,9 +132,7 @@ struct Promise<void> {
         return std::coroutine_handle<Promise>::from_promise(*this);
     }
 
-    Promise() = default;
-    Promise(Promise &&) = delete;
-    ~Promise() = default;
+    Promise &operator=(Promise &&) = delete;
     
     std::coroutine_handle<> _previous {}; // 上一个协程句柄
 };
@@ -124,13 +147,16 @@ struct Task {
     Task(Task &&) = delete;
 
     ~Task() {
-        _coroutine.destroy();
+        if (_coroutine)
+            _coroutine.destroy();
     }
 
     struct Awaiter {
         bool await_ready() const noexcept { return false; }
 
-        std::coroutine_handle<promise_type> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
+        std::coroutine_handle<promise_type> await_suspend(
+            std::coroutine_handle<> coroutine
+        ) const noexcept {
             _coroutine.promise()._previous = coroutine;
             return _coroutine;
         }
@@ -250,6 +276,9 @@ Task<int> taskFun01() {
     std::cout << "hello1开始睡1秒\n";
     co_await sleep_for(1s); // 1s 等价于 std::chrono::seconds(1);
     std::cout << "hello1睡醒了\n";
+    std::cout << "hello1继续睡1秒\n";
+    co_await sleep_for(1s); // 1s 等价于 std::chrono::seconds(1);
+    std::cout << "hello1睡醒了\n";
     co_return 1;
 }
 
@@ -271,5 +300,7 @@ int main() {
     Loop::getLoop().addTask(task_01);
     Loop::getLoop().addTask(task_02);
     Loop::getLoop().runAll();
+    std::cout << "看看01: " << task_01._coroutine.promise().result() << '\n';
+    std::cout << "看看02: " << task_02._coroutine.promise().result() << '\n';
     return 0;
 }
