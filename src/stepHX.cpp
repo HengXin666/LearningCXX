@@ -7,42 +7,8 @@
 #include <thread>
 
 #include "HX/Uninitialized.hpp"
-
-/**
- * @brief 协程模式: 不暂停
- */
-struct RepeatAwaiter {
-    bool await_ready() const noexcept { return false; }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
-        if (coroutine.done())
-            return std::noop_coroutine();
-        else
-            return coroutine;
-    }
-
-    void await_resume() const noexcept {}
-};
-
-/**
- * @brief 协程模式: 暂停, 会运行之前的协程
- */
-struct PreviousAwaiter {
-    bool await_ready() const noexcept {
-        return false;
-    }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> coroutine) const noexcept {
-        if (_previous)
-            return _previous;
-        else
-            return std::noop_coroutine();
-    }
-
-    void await_resume() const noexcept {}
-
-    std::coroutine_handle<> _previous; // 之前的协程
-};
+#include "HX/RepeatAwaiter.hpp"
+#include "HX/PreviousAwaiter.hpp"
 
 template <class T>
 struct Promise {
@@ -51,10 +17,12 @@ struct Promise {
     }
 
     auto final_suspend() noexcept {
-        return PreviousAwaiter(_previous);
+        return HX::PreviousAwaiter(_previous);
     }
 
-    void unhandled_exception() noexcept {}
+    void unhandled_exception() noexcept {
+        _exception = std::current_exception();
+    }
 
     void return_value(const T& res) {
         _res.putVal(res);
@@ -66,6 +34,9 @@ struct Promise {
     }
 
     T result() {
+        if (_exception) [[unlikely]] {
+            std::rethrow_exception(_exception);
+        }
         return _res.moveVal();
     }
 
@@ -88,15 +59,20 @@ struct Promise<void> {
     }
 
     auto final_suspend() noexcept {
-        return PreviousAwaiter(_previous);
+        return HX::PreviousAwaiter(_previous);
     }
 
-    void unhandled_exception() noexcept {}
+    void unhandled_exception() noexcept {
+        _exception = std::current_exception();
+    }
 
     void return_void() noexcept {
     }
 
     void result() {
+        if (_exception) [[unlikely]] {
+            std::rethrow_exception(_exception);
+        }
     }
 
     std::coroutine_handle<Promise> get_return_object() {
@@ -106,6 +82,7 @@ struct Promise<void> {
     Promise &operator=(Promise &&) = delete;
     
     std::coroutine_handle<> _previous {}; // 上一个协程句柄
+    std::exception_ptr _exception {}; // 异常信息
 };
 
 template <class T = void>
@@ -269,7 +246,40 @@ Task<std::string> taskFun03() {
     co_return "好难qwq";
 }
 
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <array>
+#include <vector>
+
 int main() {
+    // 使用epoll监测stdin
+
+    // 设置非阻塞
+    int ioFd = 1;
+    int flags = fcntl(ioFd, F_GETFL);
+    flags |= O_NONBLOCK;
+    fcntl(ioFd, F_SETFL, flags);
+
+    int epfd = epoll_create1(0);
+    struct ::epoll_event ev;
+    ev.data.fd = ioFd;
+    ev.events = EPOLLIN;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, ioFd, &ev);
+
+    while(1) {
+        std::array<struct ::epoll_event, 16> evs;
+        int len = epoll_wait(epfd, evs.data(), evs.size(), -1);
+        for (int i = 0; i < len; ++i) {
+            std::string buf;
+            char c;
+            while (int len = ::read(evs[i].data.fd, &c, 1) > 0) {
+                buf.push_back(c);
+            }
+            std::cout << buf << '\n';
+        }
+    }
+#if 0
     /**
      * @brief 计划: 制作一个协程定时器
      *        功能: 比如暂停 1s 和 2s, 最终只会暂停 min(1s, 2s)
@@ -285,5 +295,6 @@ int main() {
     std::cout << "看看01: " << task_01._coroutine.promise().result() << '\n';
     std::cout << "看看02: " << task_02._coroutine.promise().result() << '\n';
     std::cout << "看看03: " << task_03._coroutine.promise().result() << '\n';
+#endif
     return 0;
 }
