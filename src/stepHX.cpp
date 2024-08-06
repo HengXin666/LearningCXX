@@ -6,128 +6,9 @@
 #include <string>
 #include <thread>
 
-#include "HX/Uninitialized.hpp"
-#include "HX/RepeatAwaiter.hpp"
-#include "HX/PreviousAwaiter.hpp"
+#include "HX/Task.hpp"
 
-template <class T>
-struct Promise {
-    auto initial_suspend() { 
-        return std::suspend_always(); // 第一次创建, 直接挂起
-    }
-
-    auto final_suspend() noexcept {
-        return HX::PreviousAwaiter(_previous);
-    }
-
-    void unhandled_exception() noexcept {
-        _exception = std::current_exception();
-    }
-
-    void return_value(const T& res) {
-        _res.putVal(res);
-    }
-
-    auto yield_value(T&& res) {
-        _res.putVal(res);
-        return std::suspend_always(); // 挂起协程
-    }
-
-    T result() {
-        if (_exception) [[unlikely]] {
-            std::rethrow_exception(_exception);
-        }
-        return _res.moveVal();
-    }
-
-    std::coroutine_handle<Promise> get_return_object() {
-        return std::coroutine_handle<Promise>::from_promise(*this);
-    }
-
-    Promise &operator=(Promise &&) = delete;
-
-    HX::Uninitialized<T> _res;
-    
-    std::coroutine_handle<> _previous {}; // 上一个协程句柄
-    std::exception_ptr _exception {}; // 异常信息
-};
-
-template <>
-struct Promise<void> {
-    auto initial_suspend() { 
-        return std::suspend_always();
-    }
-
-    auto final_suspend() noexcept {
-        return HX::PreviousAwaiter(_previous);
-    }
-
-    void unhandled_exception() noexcept {
-        _exception = std::current_exception();
-    }
-
-    void return_void() noexcept {
-    }
-
-    void result() {
-        if (_exception) [[unlikely]] {
-            std::rethrow_exception(_exception);
-        }
-    }
-
-    std::coroutine_handle<Promise> get_return_object() {
-        return std::coroutine_handle<Promise>::from_promise(*this);
-    }
-
-    Promise &operator=(Promise &&) = delete;
-    
-    std::coroutine_handle<> _previous {}; // 上一个协程句柄
-    std::exception_ptr _exception {}; // 异常信息
-};
-
-template <class T = void>
-struct Task {
-    using promise_type = Promise<T>;
-
-    Task(std::coroutine_handle<promise_type> coroutine) noexcept
-        : _coroutine(coroutine) {}
-
-    Task(Task &&) = delete;
-
-    ~Task() {
-        if (_coroutine)
-            _coroutine.destroy();
-    }
-
-    struct Awaiter {
-        bool await_ready() const noexcept { 
-            return false; 
-        }
-
-        std::coroutine_handle<promise_type> await_suspend(
-            std::coroutine_handle<> coroutine
-        ) const noexcept {
-            _coroutine.promise()._previous = coroutine;
-            return _coroutine;
-        }
-
-        T await_resume() const {
-            return _coroutine.promise().result();
-        }
-
-        std::coroutine_handle<promise_type> _coroutine;
-    };
-
-    auto operator co_await() const noexcept {
-        return Awaiter(_coroutine);
-    }
-
-    operator std::coroutine_handle<>() const noexcept {
-        return _coroutine;
-    }
-
-    std::coroutine_handle<promise_type> _coroutine; // 当前协程句柄
-};
+using namespace HX;
 
 struct Loop {
     void addTask(std::coroutine_handle<> coroutine) {
@@ -141,15 +22,18 @@ struct Loop {
         _timer.insert({expireTime, coroutine});
     }
 
+    /**
+     * @brief 执行全部任务
+     */
     void runAll() {
         while (_timer.size() || _taskQueue.size()) {
-            while (_taskQueue.size()) {
+            while (_taskQueue.size()) { // 执行协程任务
                 auto task = std::move(_taskQueue.front());
                 _taskQueue.pop();
                 task.resume();
             }
 
-            if (_timer.size()) {
+            if (_timer.size()) { // 执行计时器任务
                 auto now = std::chrono::system_clock::now();
                 auto it = _timer.begin();
                 if (now >= it->first) {
@@ -161,7 +45,7 @@ struct Loop {
                         it = _timer.begin();
                     } while (now >= it->first);
                 } else {
-                    std::this_thread::sleep_until(it->first);
+                    std::this_thread::sleep_until(it->first); // 全场睡大觉 [阻塞]
                 }
             }
         }
@@ -190,15 +74,15 @@ private:
  * @brief 暂停者
  */
 struct SleepAwaiter { // 使用 co_await 则需要定义这 3 个固定函数
-    bool await_ready() const noexcept {
+    bool await_ready() const noexcept { // 暂停
         return false;
     }
 
-    void await_suspend(std::coroutine_handle<> coroutine) const {
+    void await_suspend(std::coroutine_handle<> coroutine) const { // `await_ready`后执行: 添加计时器
         Loop::getLoop().addTimer(_expireTime, coroutine);
     }
 
-    void await_resume() const noexcept {
+    void await_resume() const noexcept { // 计时结束
     }
 
     std::chrono::system_clock::time_point _expireTime; // 过期时间
@@ -254,7 +138,7 @@ Task<std::string> taskFun03() {
 
 int main() {
     // 使用epoll监测stdin
-
+#if 0
     // 设置非阻塞
     int ioFd = 1;
     int flags = fcntl(ioFd, F_GETFL);
@@ -279,7 +163,7 @@ int main() {
             std::cout << buf << '\n';
         }
     }
-#if 0
+#else
     /**
      * @brief 计划: 制作一个协程定时器
      *        功能: 比如暂停 1s 和 2s, 最终只会暂停 min(1s, 2s)
