@@ -104,6 +104,72 @@ Task<void> sleep_for(std::chrono::system_clock::duration  duration) {
     co_await SleepAwaiter(std::chrono::system_clock::now() + duration);
 }
 
+template <class T = void> 
+struct NonVoidHelper {
+    using Type = T;
+};
+
+template <> 
+struct NonVoidHelper<void> {
+    using Type = NonVoidHelper;
+
+    explicit NonVoidHelper() = default;
+};
+
+template <class A>
+concept Awaiter = requires(A a, std::coroutine_handle<> h) {
+    { a.await_ready() };
+    { a.await_suspend(h) };
+    { a.await_resume() };
+};
+
+template <class A>
+concept Awaitable = Awaiter<A> || requires(A a) {
+    { a.operator co_await() } -> Awaiter;
+};
+
+template <class A> 
+struct AwaitableTraits;
+
+template <Awaiter A> 
+struct AwaitableTraits<A> {
+    // C++11 std::declva 获取函数返回值类型
+    using RetType = decltype(std::declval<A>().await_resume());
+    using NonVoidRetType = NonVoidHelper<RetType>::Type;
+};
+
+template <class A>
+    requires(!Awaiter<A> && Awaitable<A>)
+struct AwaitableTraits<A>
+    : AwaitableTraits<decltype(std::declval<A>().operator co_await())> 
+{};
+
+
+struct WhenAnyAwaiter {
+    bool await_ready() const noexcept { // 暂停
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> coroutine) const { // `await_ready`后执行: 添加计时器
+        if (_tasks.empty()) return coroutine;
+            mControl.mPrevious = coroutine;
+        for (auto const &t: _tasks.subspan(0, mTasks.size() - 1))
+            t.mCoroutine.resume();
+        return _tasks.back().mCoroutine;
+    }
+
+    void await_resume() const noexcept { // 计时结束
+    }
+
+    std::span<Task<> const> _tasks;
+};
+
+template <class... Ts>
+Task<std::variant<typename AwaitableTraits<Ts>::RetType...>> WhenAny(Ts&&... args) {
+    std::size_t size = sizeof...(Ts);
+
+}
+
 using namespace std::chrono;
 
 Task<int> taskFun01() {
@@ -128,6 +194,10 @@ Task<std::string> taskFun03() {
     co_await sleep_for(500ms);
     std::cout << "hello3睡醒了\n";
     co_return "好难qwq";
+}
+
+Task<void> co_main() {
+    auto v = co_await WhenAny(taskFun01(), taskFun02());
 }
 
 #include <sys/epoll.h>
@@ -163,7 +233,7 @@ int main() {
             std::cout << buf << '\n';
         }
     }
-#else
+#elif 0
     /**
      * @brief 计划: 制作一个协程定时器
      *        功能: 比如暂停 1s 和 2s, 最终只会暂停 min(1s, 2s)
@@ -179,6 +249,8 @@ int main() {
     std::cout << "看看01: " << task_01._coroutine.promise().result() << '\n';
     std::cout << "看看02: " << task_02._coroutine.promise().result() << '\n';
     std::cout << "看看03: " << task_03._coroutine.promise().result() << '\n';
+#elif 1
+    co_main();
 #endif
     return 0;
 }
