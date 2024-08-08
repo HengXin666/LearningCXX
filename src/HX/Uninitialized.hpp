@@ -25,6 +25,27 @@
 
 namespace HX {
 
+template <class T = void>
+struct NonVoidHelper {
+    using Type = T;
+};
+
+template <>
+struct NonVoidHelper<void> {
+    using Type = NonVoidHelper;
+
+    explicit NonVoidHelper() = default;
+
+    template <class T>
+    constexpr friend T &&operator,(T &&t, NonVoidHelper) {
+        return std::forward<T>(t);
+    }
+
+    char const *repr() const noexcept {
+        return "NonVoidHelper";
+    }
+};
+
 /**
  * @brief 一个未初始化的值 (用于延迟初始化)
  * @tparam T 值类型
@@ -63,18 +84,21 @@ public:
 template <>
 class Uninitialized<void> {
 public:
-    void moveVal() {}
-    void putVal() {}
+    auto moveVal() {
+        return NonVoidHelper<> {};
+    }
+    
+    void putVal(NonVoidHelper<>) {}
 };
 
 template <class T>
-struct Uninitialized<T const> : Uninitialized<T> {};
+class Uninitialized<T const> : public Uninitialized<T> {};
 
 template <class T>
-struct Uninitialized<T &> : Uninitialized<std::reference_wrapper<T>> {};
+class Uninitialized<T &> : public Uninitialized<std::reference_wrapper<T>> {};
 
 template <class T>
-struct Uninitialized<T &&> : Uninitialized<T> {};
+class Uninitialized<T &&> : public Uninitialized<T> {};
 
 } // namespace HX
 

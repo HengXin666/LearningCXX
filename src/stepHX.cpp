@@ -16,6 +16,7 @@
 #include <sys/un.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <string_view>
 #include <source_location>
 
 #include "HX/Task.hpp"
@@ -146,16 +147,16 @@ class EpollLoop {
     EpollLoop& operator=(EpollLoop&&) = delete;
 
     explicit EpollLoop() : _epfd(::epoll_create1(0))
-                         , evs()
+                         , _evs()
     {
-        evs.resize(64);
+        _evs.resize(64);
     }
 
     ~EpollLoop() {
         ::close(_epfd);
     }
 
-    std::vector<struct ::epoll_event> evs;
+    std::vector<struct ::epoll_event> _evs;
 public:
     static EpollLoop& get() {
         static EpollLoop loop;
@@ -168,44 +169,10 @@ public:
 
     bool addListener(class EpollFilePromise &promise, EpollEventMask mask, int ctl);
 
+    bool run(std::optional<std::chrono::system_clock::duration> timeout);
+
     int _epfd = -1;
     int _count = 0;
-};
-
-class AsyncFile {
-protected:
-    int _fd = -1;
-public:
-    explicit AsyncFile(int fd) : _fd(fd) {
-        int flags = ::fcntl(_fd, F_GETFL);
-        flags |= O_NONBLOCK;
-        ::fcntl(_fd, F_SETFL, flags);
-
-        struct epoll_event event;
-        event.events = EPOLLET;
-        event.data.ptr = nullptr;
-        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_ADD, _fd, &event);
-    }
-
-    AsyncFile(AsyncFile &&that) noexcept : _fd(that._fd) {
-        that._fd = -1;
-    }
-
-    AsyncFile &operator=(AsyncFile &&that) noexcept {
-        std::swap(_fd, that._fd);
-        return *this;
-    }
-
-    int getFd() const {
-        return _fd;
-    }
-
-    ~AsyncFile() {
-        if (_fd == -1) {
-            return;
-        }
-        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_DEL, _fd, nullptr);
-    }
 };
 
 struct EpollFilePromise : HX::Promise<EpollEventMask> {
@@ -233,6 +200,23 @@ bool EpollLoop::addListener(EpollFilePromise &promise, EpollEventMask mask, int 
         return false;
     if (ctl == EPOLL_CTL_ADD)
         ++_count;
+    return true;
+}
+
+bool EpollLoop::run(std::optional<std::chrono::system_clock::duration> timeout) {
+    if (!_count)
+        return false;
+    int epollTimeOut = -1;
+    if (timeout) {
+        epollTimeOut = timeout->count();
+    }
+    int len = epoll_wait(_epfd, _evs.data(), _evs.size(), epollTimeOut);
+    for (int i = 0; i < len; ++i) {
+        auto& event = _evs[i];
+        // ((EpollFilePromise *)event.data.ptr)->_previous.resume();
+        auto& promise = *(EpollFilePromise *)event.data.ptr;
+        std::coroutine_handle<EpollFilePromise>::from_promise(promise).resume();
+    }
     return true;
 }
 
@@ -269,12 +253,74 @@ HX::Task<EpollEventMask, EpollFilePromise> waitFileEvent(int fd, EpollEventMask 
     co_return co_await EpollFileAwaiter(fd, mask);
 }
 
+class AsyncFile {
+protected:
+    int _fd = -1;
+public:
+    AsyncFile() = default;
+    
+
+    explicit AsyncFile(int fd) noexcept : _fd(fd) {
+        int flags = ::fcntl(_fd, F_GETFL);
+        flags |= O_NONBLOCK;
+        ::fcntl(_fd, F_SETFL, flags);
+
+        struct epoll_event event;
+        event.events = EPOLLET;
+        event.data.ptr = nullptr;
+        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_ADD, _fd, &event);
+    }
+
+    HX::Task<ssize_t, EpollFilePromise> writeFile(std::string_view str) {
+        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLERR | EPOLLET | EPOLLONESHOT);
+        ssize_t writeLen = ::write(_fd, str.data(), str.size());
+        if (writeLen == -1 && errno != ECANCELED) {
+            try {
+                checkError(writeLen);
+            } catch(const std::exception& e) {
+                std::cerr << e.what() << '\n';
+            }
+            throw;
+        }
+        co_return writeLen;
+    }
+
+    HX::Task<ssize_t, EpollFilePromise> readFile(std::span<char> buf) {
+        co_await waitFileEvent(_fd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLONESHOT);
+        ssize_t readLen = ::read(_fd, buf.data(), buf.size());
+        if (readLen == -1 && errno != ECANCELED) {
+            throw;
+        }
+        co_return readLen;
+    }
+
+    AsyncFile(AsyncFile &&that) noexcept : _fd(that._fd) {
+        that._fd = -1;
+    }
+
+    AsyncFile &operator=(AsyncFile &&that) noexcept {
+        std::swap(_fd, that._fd);
+        return *this;
+    }
+
+    int getFd() const {
+        return _fd;
+    }
+
+    ~AsyncFile() {
+        if (_fd == -1) {
+            return;
+        }
+        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_DEL, _fd, nullptr);
+    }
+};
+
 HX::Task<void> socketConnect(
     AsyncFile& fd,
     const struct sockaddr_in& sockaddr
 ) {
     int res = ::connect(fd.getFd(), (struct sockaddr *)&sockaddr, sizeof(sockaddr));
-    if (res == -1) {
+    if (res == -1) [[unlikely]] { // 这里是干什么??
         co_await waitFileEvent(fd.getFd(), EPOLLOUT | EPOLLET | EPOLLONESHOT);
     }
 }
@@ -296,21 +342,19 @@ HX::Task<AsyncFile> createTcpClientByIpV4(const char *ip, int port) {
 
     co_await socketConnect(res, sockaddr);
 
-    co_return res;
+    co_return std::move(res);
 }
 
 HX::Task<void> co_main() {
     auto client = co_await createTcpClientByIpV4("127.0.0.1", 28205);
-    while (true) {
-        auto data = co_await read();
-        std::cout << "收到消息: " << data << '\n';
-        if (data == "exit")
-            break;
-    }
+    co_await client.writeFile("GET / HTTP/1.1\r\n\r\n");
+    std::vector<char> buf(4096);
+    auto data = co_await client.readFile(buf);
+    std::cout << "收到消息: " << data << '\n';
 }
 
 int main() {
-
+    co_main()._coroutine.resume();
     return 0;
 }
 

@@ -40,8 +40,8 @@ struct Promise {
         _exception = std::current_exception();
     }
 
-    void return_value(const T& res) {
-        _res.putVal(res);
+    void return_value(T&& res) {
+        _res.putVal(std::move(res));
     }
 
     auto yield_value(T&& res) {
