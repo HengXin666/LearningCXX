@@ -165,6 +165,7 @@ public:
 
     void removeListener(int fd) {
         ::epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
+        --_count;
     }
 
     bool addListener(class EpollFilePromise &promise, EpollEventMask mask, int ctl);
@@ -195,7 +196,12 @@ bool EpollLoop::addListener(EpollFilePromise &promise, EpollEventMask mask, int 
     struct ::epoll_event event;
     event.events = mask;
     event.data.ptr = &promise;
-    int res = epoll_ctl(_epfd, ctl, promise._fd, &event);
+    int res = ::epoll_ctl(_epfd, ctl, promise._fd, &event); // 这里返回了 -1 !!!
+    try {
+        checkError(res);
+    } catch(const std::exception& e) {
+        std::cerr << e.what() << " Erron: " << errno << '\n';
+    }
     if (res == -1)
         return false;
     if (ctl == EPOLL_CTL_ADD)
@@ -231,13 +237,15 @@ struct EpollFileAwaiter {
         return false;
     }
 
-    void await_suspend(std::coroutine_handle<EpollFilePromise> coroutine) {
+    bool await_suspend(std::coroutine_handle<EpollFilePromise> coroutine) {
         auto &promise = coroutine.promise();
         promise._fd = _fd;
         if (!EpollLoop::get().addListener(promise, _mask, _ctl)) {
             promise._fd = -1;
             coroutine.resume();
+            return true;
         }
+        return false;
     }
 
     EpollEventMask await_resume() const noexcept {
@@ -259,7 +267,6 @@ protected:
 public:
     AsyncFile() = default;
     
-
     explicit AsyncFile(int fd) noexcept : _fd(fd) {
         int flags = ::fcntl(_fd, F_GETFL);
         flags |= O_NONBLOCK;
@@ -272,13 +279,13 @@ public:
     }
 
     HX::Task<ssize_t, EpollFilePromise> writeFile(std::string_view str) {
-        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLERR | EPOLLET | EPOLLONESHOT);
+        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLERR | EPOLLET | EPOLLONESHOT); // 为什么不再这里 co_await ?
         ssize_t writeLen = ::write(_fd, str.data(), str.size());
-        if (writeLen == -1 && errno != ECANCELED) {
+        if (writeLen == -1 && errno != 11) {
             try {
                 checkError(writeLen);
             } catch(const std::exception& e) {
-                std::cerr << e.what() << '\n';
+                std::cerr << e.what() << " Erron: " << errno << '\n';
             }
             throw;
         }
@@ -288,7 +295,12 @@ public:
     HX::Task<ssize_t, EpollFilePromise> readFile(std::span<char> buf) {
         co_await waitFileEvent(_fd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLONESHOT);
         ssize_t readLen = ::read(_fd, buf.data(), buf.size());
-        if (readLen == -1 && errno != ECANCELED) {
+        if (readLen == -1 && errno != 11) {
+            try {
+                checkError(readLen);
+            } catch(const std::exception& e) {
+                std::cerr << e.what() << " Erron: " << errno << '\n';
+            }
             throw;
         }
         co_return readLen;
@@ -349,12 +361,14 @@ HX::Task<void> co_main() {
     auto client = co_await createTcpClientByIpV4("127.0.0.1", 28205);
     co_await client.writeFile("GET / HTTP/1.1\r\n\r\n");
     std::vector<char> buf(4096);
-    auto data = co_await client.readFile(buf);
-    std::cout << "收到消息: " << data << '\n';
+    auto dataSize = co_await client.readFile(buf);
+    std::cout << "收到消息长度: " << dataSize << "\n内容是: " << std::string {buf.data(), (std::size_t)dataSize} << '\n';
 }
 
 int main() {
     co_main()._coroutine.resume();
+    printf("awa\n");
+    EpollLoop::get().run(std::nullopt);
     return 0;
 }
 
