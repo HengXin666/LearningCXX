@@ -1,3 +1,6 @@
+#include <string.h>
+#include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <chrono>
@@ -10,10 +13,37 @@
 #include <fcntl.h>
 #include <array>
 #include <vector>
+#include <sys/un.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <source_location>
 
 #include "HX/Task.hpp"
 
+/**
+ * @brief 并没有错误处理哦!
+ */
+
 using namespace std::chrono;
+
+auto checkError(
+    auto res, 
+    std::source_location const &loc = std::source_location::current()
+) {
+    if (res == -1) [[unlikely]] {
+        throw std::system_error(
+            errno, 
+            std::system_category(),
+            (std::string)loc.file_name() + ":" + std::to_string(loc.line())
+        );
+    }
+    return res;
+}
+
+/**
+ * @brief Epoll 事件掩码
+ */
+using EpollEventMask = uint32_t;
 
 class TimerLoop {
     void addTimer(
@@ -112,10 +142,178 @@ private:
     std::queue<std::coroutine_handle<>> _taskQueue;
 };
 
-
 class EpollLoop {
-    
+    EpollLoop& operator=(EpollLoop&&) = delete;
+
+    explicit EpollLoop() : _epfd(::epoll_create1(0))
+                         , evs()
+    {
+        evs.resize(64);
+    }
+
+    ~EpollLoop() {
+        ::close(_epfd);
+    }
+
+    std::vector<struct ::epoll_event> evs;
+public:
+    static EpollLoop& get() {
+        static EpollLoop loop;
+        return loop;
+    }
+
+    void removeListener(int fd) {
+        ::epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
+    }
+
+    bool addListener(class EpollFilePromise &promise, EpollEventMask mask, int ctl);
+
+    int _epfd = -1;
+    int _count = 0;
 };
+
+class AsyncFile {
+protected:
+    int _fd = -1;
+public:
+    explicit AsyncFile(int fd) : _fd(fd) {
+        int flags = ::fcntl(_fd, F_GETFL);
+        flags |= O_NONBLOCK;
+        ::fcntl(_fd, F_SETFL, flags);
+
+        struct epoll_event event;
+        event.events = EPOLLET;
+        event.data.ptr = nullptr;
+        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_ADD, _fd, &event);
+    }
+
+    AsyncFile(AsyncFile &&that) noexcept : _fd(that._fd) {
+        that._fd = -1;
+    }
+
+    AsyncFile &operator=(AsyncFile &&that) noexcept {
+        std::swap(_fd, that._fd);
+        return *this;
+    }
+
+    int getFd() const {
+        return _fd;
+    }
+
+    ~AsyncFile() {
+        if (_fd == -1) {
+            return;
+        }
+        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_DEL, _fd, nullptr);
+    }
+};
+
+struct EpollFilePromise : HX::Promise<EpollEventMask> {
+    auto get_return_object() {
+        return std::coroutine_handle<EpollFilePromise>::from_promise(*this);
+    }
+
+    EpollFilePromise &operator=(EpollFilePromise &&) = delete;
+
+    inline ~EpollFilePromise() {
+        if (_fd != -1) {
+            EpollLoop::get().removeListener(_fd);
+        }
+    }
+
+    int _fd = -1;
+};
+
+bool EpollLoop::addListener(EpollFilePromise &promise, EpollEventMask mask, int ctl) {
+    struct ::epoll_event event;
+    event.events = mask;
+    event.data.ptr = &promise;
+    int res = epoll_ctl(_epfd, ctl, promise._fd, &event);
+    if (res == -1)
+        return false;
+    if (ctl == EPOLL_CTL_ADD)
+        ++_count;
+    return true;
+}
+
+struct EpollFileAwaiter {
+    explicit EpollFileAwaiter(int fd, EpollEventMask mask, EpollEventMask ctl = EPOLL_CTL_ADD) 
+        : _fd(fd)
+        , _mask(mask)
+        , _ctl(ctl)
+    {} 
+
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<EpollFilePromise> coroutine) {
+        auto &promise = coroutine.promise();
+        promise._fd = _fd;
+        if (!EpollLoop::get().addListener(promise, _mask, _ctl)) {
+            promise._fd = -1;
+            coroutine.resume();
+        }
+    }
+
+    EpollEventMask await_resume() const noexcept {
+        return _mask;
+    }
+
+    int _fd = -1;
+    EpollEventMask _mask = 0;
+    int _ctl = EPOLL_CTL_ADD;
+};
+
+HX::Task<EpollEventMask, EpollFilePromise> waitFileEvent(int fd, EpollEventMask mask) {
+    co_return co_await EpollFileAwaiter(fd, mask);
+}
+
+HX::Task<void> socketConnect(
+    AsyncFile& fd,
+    const struct sockaddr_in& sockaddr
+) {
+    int res = ::connect(fd.getFd(), (struct sockaddr *)&sockaddr, sizeof(sockaddr));
+    if (res == -1) {
+        co_await waitFileEvent(fd.getFd(), EPOLLOUT | EPOLLET | EPOLLONESHOT);
+    }
+}
+
+/**
+ * @brief 创建tcp ipv4 连接
+ * @param ip 
+ * @param post 
+ * @return HX::Task<AsyncFile> 
+ */
+HX::Task<AsyncFile> createTcpClientByIpV4(const char *ip, int port) {
+    AsyncFile res {::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)};
+
+    struct sockaddr_in sockaddr;
+    std::memset(&sockaddr, 0, sizeof(sockaddr));
+    sockaddr.sin_family = AF_INET;
+    sockaddr.sin_addr.s_addr = inet_addr(ip);
+    sockaddr.sin_port = htons(port);
+
+    co_await socketConnect(res, sockaddr);
+
+    co_return res;
+}
+
+HX::Task<void> co_main() {
+    auto client = co_await createTcpClientByIpV4("127.0.0.1", 28205);
+    while (true) {
+        auto data = co_await read();
+        std::cout << "收到消息: " << data << '\n';
+        if (data == "exit")
+            break;
+    }
+}
+
+int main() {
+
+    return 0;
+}
+
 
 HX::Task<int> taskFun01() {
     std::cout << "hello1开始睡1秒\n";
@@ -141,7 +339,7 @@ HX::Task<std::string> taskFun03() {
     co_return "好难qwq";
 }
 
-int main() {
+int _main() {
     // 使用epoll监测stdin
 #if 0
     // 设置非阻塞
