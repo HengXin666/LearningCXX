@@ -171,7 +171,6 @@ class EpollLoop {
         ::close(_epfd);
     }
 
-    std::vector<struct ::epoll_event> _evs;
 public:
     static EpollLoop& get() {
         static EpollLoop loop;
@@ -192,7 +191,9 @@ public:
     }
 
     int _epfd = -1;
+private:
     int _count = 0;
+    std::vector<struct ::epoll_event> _evs;
 };
 
 struct EpollFilePromise : HX::Promise<EpollEventMask> {
@@ -226,8 +227,8 @@ bool EpollLoop::addListener(EpollFilePromise &promise, EpollEventMask mask, int 
 }
 
 bool EpollLoop::run(std::optional<std::chrono::system_clock::duration> timeout) {
-    // if (!_count)
-    //     return false;
+    if (!_count)
+        return false;
     int epollTimeOut = -1;
     if (timeout) {
         epollTimeOut = timeout->count();
@@ -235,7 +236,7 @@ bool EpollLoop::run(std::optional<std::chrono::system_clock::duration> timeout) 
     int len = epoll_wait(_epfd, _evs.data(), _evs.size(), epollTimeOut);
     for (int i = 0; i < len; ++i) {
         auto& event = _evs[i];
-        // ((EpollFilePromise *)event.data.ptr)->_previous.resume();
+        // ((EpollFilePromise *)event.data.ptr)->_previous.resume(); // 下面的更标准
         auto& promise = *(EpollFilePromise *)event.data.ptr;
         std::coroutine_handle<EpollFilePromise>::from_promise(promise).resume();
     }
@@ -243,7 +244,7 @@ bool EpollLoop::run(std::optional<std::chrono::system_clock::duration> timeout) 
 }
 
 struct EpollFileAwaiter {
-    explicit EpollFileAwaiter(int fd, EpollEventMask mask, EpollEventMask ctl = EPOLL_CTL_MOD) 
+    explicit EpollFileAwaiter(int fd, EpollEventMask mask, EpollEventMask ctl = EPOLL_CTL_ADD) 
         : _fd(fd)
         , _mask(mask)
         , _ctl(ctl)
@@ -268,13 +269,13 @@ struct EpollFileAwaiter {
 
     int _fd = -1;
     EpollEventMask _mask = 0;
-    int _ctl = EPOLL_CTL_MOD;
+    int _ctl = EPOLL_CTL_ADD;
 };
 
 HX::Task<EpollEventMask, EpollFilePromise> waitFileEvent(
     int fd, 
     EpollEventMask mask, 
-    int ctl = EPOLL_CTL_MOD
+    int ctl = EPOLL_CTL_ADD
 ) {
     co_return co_await EpollFileAwaiter(fd, mask, ctl);
 }
@@ -286,20 +287,14 @@ public:
     AsyncFile() : _fd(-1)
     {}
     
-    explicit AsyncFile(int fd) noexcept : _fd(fd) {
+    explicit AsyncFile(int fd) noexcept : _fd(fd) { // 设置非阻塞
         int flags = ::fcntl(_fd, F_GETFL);
         flags |= O_NONBLOCK;
         ::fcntl(_fd, F_SETFL, flags);
-
-        struct epoll_event event;
-        event.events = EPOLLET;
-        event.data.ptr = nullptr;
-        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_ADD, _fd, &event);
-        ++EpollLoop::get()._count;
     }
 
     HX::Task<ssize_t, EpollFilePromise> writeFile(std::string_view str) {
-        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLERR | EPOLLET | EPOLLONESHOT); // 为什么不再这里 co_await ?
+        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLHUP); // 为什么不再这里 co_await ?
         ssize_t writeLen = ::write(_fd, str.data(), str.size());
         if (writeLen == -1 && errno != 11) {
             try {
@@ -313,7 +308,7 @@ public:
     }
 
     HX::Task<ssize_t, EpollFilePromise> readFile(std::span<char> buf) {
-        co_await waitFileEvent(_fd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLONESHOT);
+        co_await waitFileEvent(_fd, EPOLLIN | EPOLLRDHUP);
         ssize_t readLen = ::read(_fd, buf.data(), buf.size());
         if (readLen == -1 && errno != 11) {
             try {
@@ -355,17 +350,18 @@ HX::Task<void> socketConnect(
     int res = ::connect(fd.getFd(), (struct sockaddr *)&sockaddr, sizeof(sockaddr));
     // 非阻塞的
     while (res == -1) [[unlikely]] { // 这里是干什么??
-        printf("socket connect error: errno=%d errmsg=%s\n", errno, strerror(errno));
+        if (errno == 115)
+            printf("等待连接...\n");
+        else
+            printf("socket connect error: errno=%d errmsg=%s\n", errno, strerror(errno));
         co_await waitFileEvent(fd.getFd(), EPOLLOUT | EPOLLERR | EPOLLHUP);
         int error = 0;
         socklen_t len = sizeof(error);
         if (::getsockopt(fd.getFd(), SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
-            printf("%d ???\n", error);
-            if (error == 0) {
-                // 连接成功
+            if (error == 0) { // 连接成功
+                printf("连接成功~\n");
                 break;
-            } else {
-                // 连接失败
+            } else { // 连接失败
                 printf("连接失败~\n");
             }
         }
@@ -374,7 +370,7 @@ HX::Task<void> socketConnect(
 
 /**
  * @brief 创建tcp ipv4 连接
- * @param ip 
+ * @param ip 只能是ipv4的 xxx.xxx.xxx.xxx 的 ip
  * @param post 
  * @return HX::Task<AsyncFile> 
  */
@@ -387,18 +383,22 @@ HX::Task<AsyncFile> createTcpClientByIpV4(const char *ip, int port) {
     sockaddr.sin_port = htons(port);
 
     co_await socketConnect(res, sockaddr);
-    printf("zzz\n");
-    printf("都是sb\n");
     co_return std::move(res);
 }
 
 HX::Task<void> co_main() {
-    auto client = co_await createTcpClientByIpV4("127.0.0.1", 28205);
+    auto client = co_await createTcpClientByIpV4("183.2.172.185", 80); // 百度
     co_await client.writeFile("GET / HTTP/1.1\r\n\r\n");
-    std::vector<char> buf(4096);
-    auto dataSize = co_await client.readFile(buf);
-    std::cout << "收到消息长度: " << dataSize 
-              << "\n内容是: " << std::string_view {buf.data(), (std::size_t)dataSize} << '\n';
+    std::string str;
+    std::vector<char> buf(4096); // 注意, 还没有实现多次读取
+    ssize_t dataSize;
+    do {
+        dataSize = co_await client.readFile(buf);
+        str += std::string_view {buf.data(), (std::size_t)dataSize};
+    } while (dataSize == (ssize_t)buf.size());
+
+    std::cout << "收到消息长度: " << str.size() 
+              << "\n内容是: " << str << '\n';
 }
 
 struct AsyncLoop {
