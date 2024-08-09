@@ -60,7 +60,7 @@ struct Promise {
         return _res.moveVal();
     }
 
-    std::coroutine_handle<Promise> get_return_object() {
+    auto get_return_object() {
         return std::coroutine_handle<Promise>::from_promise(*this);
     }
 
@@ -95,7 +95,7 @@ struct Promise<void> {
         }
     }
 
-    std::coroutine_handle<Promise> get_return_object() {
+    auto get_return_object() {
         return std::coroutine_handle<Promise>::from_promise(*this);
     }
 
@@ -114,18 +114,18 @@ template <class T = void, class P = Promise<T>>
 struct [[nodiscard]] Task {
     using promise_type = P;
 
-    Task(std::coroutine_handle<promise_type> coroutine) noexcept
+    Task(std::coroutine_handle<promise_type> coroutine = nullptr) noexcept
         : _coroutine(coroutine) {}
 
-    Task(Task &&) = delete;
+    // Task(Task &&) = delete;
 
-    // Task(Task &&that) noexcept : _coroutine(that._coroutine) {
-    //     that._coroutine = nullptr;
-    // }
+    Task(Task &&that) noexcept : _coroutine(that._coroutine) {
+        that._coroutine = nullptr;
+    }
 
-    // Task &operator=(Task &&that) noexcept {
-    //     std::swap(_coroutine, that._coroutine);
-    // }
+    Task &operator=(Task &&that) noexcept {
+        std::swap(_coroutine, that._coroutine);
+    }
 
     ~Task() {
         if (_coroutine)
@@ -164,7 +164,16 @@ struct [[nodiscard]] Task {
         return _coroutine;
     }
 
+private:
     std::coroutine_handle<promise_type> _coroutine; // 当前协程句柄
+};
+
+template <class Loop, class T, class P>
+T run_task(Loop &loop, Task<T, P> const &t) {
+    auto a = t.operator co_await();
+    a.await_suspend(std::noop_coroutine()).resume();
+    loop.run();
+    return a.await_resume();
 };
 
 } // namespace HX

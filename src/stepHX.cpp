@@ -52,7 +52,7 @@ class TimerLoop {
         std::chrono::system_clock::time_point expireTime, 
         std::coroutine_handle<> coroutine
     ) {
-        _timer.insert({expireTime, coroutine});
+        _timerRBTree.insert({expireTime, coroutine});
     }
 
 public:
@@ -64,29 +64,43 @@ public:
      * @brief 执行全部任务
      */
     void runAll() {
-        while (_timer.size() || _taskQueue.size()) {
+        while (_timerRBTree.size() || _taskQueue.size()) {
             while (_taskQueue.size()) { // 执行协程任务
                 auto task = std::move(_taskQueue.front());
                 _taskQueue.pop();
                 task.resume();
             }
 
-            if (_timer.size()) { // 执行计时器任务
+            if (_timerRBTree.size()) { // 执行计时器任务
                 auto now = std::chrono::system_clock::now();
-                auto it = _timer.begin();
+                auto it = _timerRBTree.begin();
                 if (now >= it->first) {
                     do {
                         it->second.resume();
-                        _timer.erase(it);
-                        if (_timer.empty())
+                        _timerRBTree.erase(it);
+                        if (_timerRBTree.empty())
                             break;
-                        it = _timer.begin();
+                        it = _timerRBTree.begin();
                     } while (now >= it->first);
                 } else {
                     std::this_thread::sleep_until(it->first); // 全场睡大觉 [阻塞]
                 }
             }
         }
+    }
+
+    std::optional<std::chrono::system_clock::duration> run() {
+        while (_timerRBTree.size()) {
+            auto nowTime = std::chrono::system_clock::now();
+            auto it = _timerRBTree.begin();
+            if (it->first < nowTime) {
+                _timerRBTree.erase(it);
+                it->second.resume();
+            } else {
+                return it->first - nowTime;
+            }
+        }
+        return std::nullopt;
     }
 
     static TimerLoop& getLoop() {
@@ -131,14 +145,14 @@ public:
     }
 
 private:
-    explicit TimerLoop() : _timer()
+    explicit TimerLoop() : _timerRBTree()
                          , _taskQueue()
     {}
 
     TimerLoop& operator=(TimerLoop&&) = delete;
 
     /// @brief 计时器红黑树
-    std::multimap<std::chrono::system_clock::time_point, std::coroutine_handle<>> _timer;
+    std::multimap<std::chrono::system_clock::time_point, std::coroutine_handle<>> _timerRBTree;
 
     /// @brief 任务队列
     std::queue<std::coroutine_handle<>> _taskQueue;
@@ -173,6 +187,10 @@ public:
 
     bool run(std::optional<std::chrono::system_clock::duration> timeout);
 
+    bool hasEvent() const noexcept {
+        return _count != 0;
+    }
+
     int _epfd = -1;
     int _count = 0;
 };
@@ -183,6 +201,12 @@ struct EpollFilePromise : HX::Promise<EpollEventMask> {
     }
 
     EpollFilePromise &operator=(EpollFilePromise &&) = delete;
+
+    ~EpollFilePromise() {
+        if (_fd != -1) {
+            EpollLoop::get().removeListener(_fd);
+        }
+    }
 
     int _fd = -1;
 };
@@ -202,8 +226,8 @@ bool EpollLoop::addListener(EpollFilePromise &promise, EpollEventMask mask, int 
 }
 
 bool EpollLoop::run(std::optional<std::chrono::system_clock::duration> timeout) {
-    if (!_count)
-        return false;
+    // if (!_count)
+    //     return false;
     int epollTimeOut = -1;
     if (timeout) {
         epollTimeOut = timeout->count();
@@ -229,15 +253,13 @@ struct EpollFileAwaiter {
         return false;
     }
 
-    bool await_suspend(std::coroutine_handle<EpollFilePromise> coroutine) {
+    void await_suspend(std::coroutine_handle<EpollFilePromise> coroutine) {
         auto &promise = coroutine.promise();
         promise._fd = _fd;
         if (!EpollLoop::get().addListener(promise, _mask, _ctl)) {
             promise._fd = -1;
             coroutine.resume();
-            return false;
         }
-        return true;
     }
 
     EpollEventMask await_resume() const noexcept {
@@ -321,7 +343,6 @@ public:
         if (_fd == -1) {
             return;
         }
-        EpollLoop::get().removeListener(_fd);
         ::close(_fd);
         _fd = -1;
     }
@@ -359,18 +380,15 @@ HX::Task<void> socketConnect(
  */
 HX::Task<AsyncFile> createTcpClientByIpV4(const char *ip, int port) {
     AsyncFile res(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
-    try {
-        struct sockaddr_in sockaddr;
-        std::memset(&sockaddr, 0, sizeof(sockaddr));
-        sockaddr.sin_family = AF_INET;
-        sockaddr.sin_addr.s_addr = inet_addr(ip);
-        sockaddr.sin_port = htons(port);
+    struct sockaddr_in sockaddr;
+    std::memset(&sockaddr, 0, sizeof(sockaddr));
+    sockaddr.sin_family = AF_INET;
+    sockaddr.sin_addr.s_addr = inet_addr(ip);
+    sockaddr.sin_port = htons(port);
 
-        co_await socketConnect(res, sockaddr);
-        printf("zzz\n");
-    } catch (...) {
-        printf("都是sb\n");
-    }
+    co_await socketConnect(res, sockaddr);
+    printf("zzz\n");
+    printf("都是sb\n");
     co_return std::move(res);
 }
 
@@ -383,10 +401,24 @@ HX::Task<void> co_main() {
               << "\n内容是: " << std::string_view {buf.data(), (std::size_t)dataSize} << '\n';
 }
 
+struct AsyncLoop {
+    void run() {
+        while (true) {
+            auto timeout = TimerLoop::getLoop().run();
+            if (EpollLoop::get().hasEvent()) {
+                EpollLoop::get().run(timeout);
+            } else if (timeout) {
+                std::this_thread::sleep_for(*timeout);
+            } else {
+                break;
+            }
+        }
+    }
+};
+
 int main() {
-    co_main()._coroutine.resume();
-    printf("awa\n");
-    EpollLoop::get().run(std::nullopt);
+    AsyncLoop loop;
+    run_task(loop, co_main());
     return 0;
 }
 
