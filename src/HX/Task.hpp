@@ -44,6 +44,10 @@ struct Promise {
         _res.putVal(std::move(res));
     }
 
+    void return_value(const T& res) {
+        _res.putVal(res);
+    }
+
     auto yield_value(T&& res) {
         _res.putVal(res);
         return std::suspend_always(); // 挂起协程
@@ -114,6 +118,14 @@ struct [[nodiscard]] Task {
         : _coroutine(coroutine) {}
 
     Task(Task &&) = delete;
+
+    // Task(Task &&that) noexcept : _coroutine(that._coroutine) {
+    //     that._coroutine = nullptr;
+    // }
+
+    // Task &operator=(Task &&that) noexcept {
+    //     std::swap(_coroutine, that._coroutine);
+    // }
 
     ~Task() {
         if (_coroutine)
