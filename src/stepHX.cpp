@@ -191,8 +191,8 @@ public:
     }
 
     int _epfd = -1;
-private:
     int _count = 0;
+private:
     std::vector<struct ::epoll_event> _evs;
 };
 
@@ -204,9 +204,9 @@ struct EpollFilePromise : HX::Promise<EpollEventMask> {
     EpollFilePromise &operator=(EpollFilePromise &&) = delete;
 
     ~EpollFilePromise() {
-        if (_fd != -1) {
-            EpollLoop::get().removeListener(_fd);
-        }
+        // if (_fd != -1) {
+        //     EpollLoop::get().removeListener(_fd);
+        // }
     }
 
     int _fd = -1;
@@ -221,8 +221,8 @@ bool EpollLoop::addListener(EpollFilePromise &promise, EpollEventMask mask, int 
         printf("addListener error: errno=%d errmsg=%s\n", errno, strerror(errno));
         return false;
     }
-    if (ctl == EPOLL_CTL_ADD)
-        ++_count;
+    // if (ctl == EPOLL_CTL_ADD)
+    //     ++_count;
     return true;
 }
 
@@ -244,7 +244,7 @@ bool EpollLoop::run(std::optional<std::chrono::system_clock::duration> timeout) 
 }
 
 struct EpollFileAwaiter {
-    explicit EpollFileAwaiter(int fd, EpollEventMask mask, EpollEventMask ctl = EPOLL_CTL_ADD) 
+    explicit EpollFileAwaiter(int fd, EpollEventMask mask, EpollEventMask ctl) 
         : _fd(fd)
         , _mask(mask)
         , _ctl(ctl)
@@ -269,13 +269,13 @@ struct EpollFileAwaiter {
 
     int _fd = -1;
     EpollEventMask _mask = 0;
-    int _ctl = EPOLL_CTL_ADD;
+    int _ctl = EPOLL_CTL_MOD;
 };
 
 HX::Task<EpollEventMask, EpollFilePromise> waitFileEvent(
     int fd, 
     EpollEventMask mask, 
-    int ctl = EPOLL_CTL_ADD
+    int ctl = EPOLL_CTL_MOD
 ) {
     co_return co_await EpollFileAwaiter(fd, mask, ctl);
 }
@@ -291,10 +291,16 @@ public:
         int flags = ::fcntl(_fd, F_GETFL);
         flags |= O_NONBLOCK;
         ::fcntl(_fd, F_SETFL, flags);
+
+        struct epoll_event event;
+        event.events = EPOLLET;
+        event.data.ptr = nullptr;
+        ::epoll_ctl(EpollLoop::get()._epfd, EPOLL_CTL_ADD, _fd, &event);
+        ++EpollLoop::get()._count;
     }
 
     HX::Task<ssize_t, EpollFilePromise> writeFile(std::string_view str) {
-        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLHUP); // 为什么不再这里 co_await ?
+        co_await waitFileEvent(_fd, EPOLLOUT | EPOLLERR | EPOLLET | EPOLLONESHOT); // 为什么不再这里 co_await ?
         ssize_t writeLen = ::write(_fd, str.data(), str.size());
         if (writeLen == -1 && errno != 11) {
             try {
@@ -308,15 +314,12 @@ public:
     }
 
     HX::Task<ssize_t, EpollFilePromise> readFile(std::span<char> buf) {
-        co_await waitFileEvent(_fd, EPOLLIN | EPOLLRDHUP);
         ssize_t readLen = ::read(_fd, buf.data(), buf.size());
-        if (readLen == -1 && errno != 11) {
-            try {
-                checkError(readLen);
-            } catch(const std::exception& e) {
-                std::cerr << e.what() << " Erron: " << errno << '\n';
-            }
-            throw;
+        std::cout << "\b\b读取啦: " << readLen << '\n';
+        if (readLen == -1 && errno == EAGAIN) {
+            co_await waitFileEvent(_fd, EPOLLIN | EPOLLERR);
+            readLen = ::read(_fd, buf.data(), buf.size());
+            std::cout << "\b\b再次读取啦: " << readLen << '\n';
         }
         co_return readLen;
     }
@@ -338,6 +341,7 @@ public:
         if (_fd == -1) {
             return;
         }
+        EpollLoop::get().removeListener(_fd);
         ::close(_fd);
         _fd = -1;
     }
@@ -349,7 +353,7 @@ HX::Task<void> socketConnect(
 ) {
     int res = ::connect(fd.getFd(), (struct sockaddr *)&sockaddr, sizeof(sockaddr));
     // 非阻塞的
-    while (res == -1) [[unlikely]] { // 这里是干什么??
+    while (res == -1) [[unlikely]] {
         if (errno == 115)
             printf("等待连接...\n");
         else
@@ -390,12 +394,16 @@ HX::Task<void> co_main() {
     auto client = co_await createTcpClientByIpV4("183.2.172.185", 80); // 百度
     co_await client.writeFile("GET / HTTP/1.1\r\n\r\n");
     std::string str;
-    std::vector<char> buf(4096); // 注意, 还没有实现多次读取
+    std::vector<char> buf(1024);
     ssize_t dataSize;
     do {
+        std::cout << "等待数据...\n";
         dataSize = co_await client.readFile(buf);
-        str += std::string_view {buf.data(), (std::size_t)dataSize};
-    } while (dataSize == (ssize_t)buf.size());
+        if (dataSize <= 0) {
+            break;
+        }
+        str += std::string_view {buf.data(), static_cast<std::size_t>(dataSize)};
+    } while (true);
 
     std::cout << "收到消息长度: " << str.size() 
               << "\n内容是: " << str << '\n';
